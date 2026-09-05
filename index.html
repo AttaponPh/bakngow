@@ -380,6 +380,7 @@
 </style>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
 </head>
 <body>
 <div id="screens">
@@ -6835,6 +6836,43 @@
     return false;
   }
 
+  // ---------- AI fallback (Grok) + review queue ----------
+  // When the local database has no match, ask Grok for an in-character answer.
+  // The answer is shown right away, but it is NOT added to the shared brain —
+  // it's filed into a "pending" queue in Firestore that only the admin panel
+  // (see bottom of file) can approve or reject into permanent memory.
+  async function askAI(question) {
+    if (!db) return null; // no Firestore/Function support available (e.g. local file preview)
+    try {
+      const res = await fetch('/api/grok-chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question }),
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return (data && data.answer) ? data.answer : null;
+    } catch (e) {
+      console.error('askAI failed', e);
+      return null;
+    }
+  }
+
+  async function queueForReview(rawQuestion, normQuestion, answer) {
+    if (!db) return;
+    try {
+      await db.collection('pending').add({
+        characterId: active.id,
+        question: rawQuestion,
+        normQuestion: normQuestion,
+        answer: answer,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      console.error('queueForReview failed', e);
+    }
+  }
+
   async function handleSend() {
     let text = input.value.trim();
     if (!text) return;
@@ -6880,8 +6918,16 @@
       const answer = answers[Math.floor(Math.random() * answers.length)];
       addRow('bot', answer);
     } else {
-      addRow('bot', 'หา? กูไม่รู้จักคำนี้อ่ะ งงเลย สอนกูหน่อยได้ป่ะว่าควรตอบว่าไง');
-      enterTeachMode(text);
+      showTyping();
+      const aiAnswer = await askAI(text);
+      removeTyping();
+      if (aiAnswer) {
+        addRow('bot', aiAnswer);
+        queueForReview(text, normalize(text), aiAnswer); // fire-and-forget; doesn't block the chat
+      } else {
+        addRow('bot', 'หา? กูไม่รู้จักคำนี้อ่ะ งงเลย สอนกูหน่อยได้ป่ะว่าควรตอบว่าไง');
+        enterTeachMode(text);
+      }
     }
   }
 
@@ -6936,6 +6982,132 @@
     if (kind === 'bot' && previewText) previewText.textContent = text;
     return row;
   };
+
+  // ---------- Hidden admin panel: review queue for AI-generated answers ----------
+  // Real authentication via Firebase Auth (email + password). Only an account
+  // that exists in the Firebase project's Authentication tab can sign in —
+  // there is no public sign-up form, so only whoever creates that account
+  // (you, in Firebase Console) can ever get in.
+  // Visit:  https://bakngow.netlify.app/?admin=1
+  const urlParams = new URLSearchParams(window.location.search);
+
+  if (urlParams.get('admin') === '1') {
+    initAdminPanel();
+  }
+
+  function initAdminPanel() {
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:#F2E9D3;z-index:9999;overflow-y:auto;font-family:Mitr,sans-serif;padding:16px;';
+    overlay.innerHTML = `
+      <div id="adminLoginBox" style="max-width:320px;margin:60px auto;background:#FBF6E9;border:2px solid #E9DCBB;border-radius:12px;padding:20px;">
+        <h2 style="font-family:Chonburi,cursive;color:#3A2A1B;margin:0 0 16px;font-size:20px;">ล็อกอินแอดมิน</h2>
+        <input id="adminEmail" type="email" placeholder="อีเมล" style="width:100%;box-sizing:border-box;padding:10px;margin-bottom:8px;border-radius:8px;border:1px solid #E9DCBB;" />
+        <input id="adminPassword" type="password" placeholder="รหัสผ่าน" style="width:100%;box-sizing:border-box;padding:10px;margin-bottom:12px;border-radius:8px;border:1px solid #E9DCBB;" />
+        <button id="adminLoginBtn" style="width:100%;background:#DE8531;color:#fff;border:none;border-radius:8px;padding:10px;cursor:pointer;">เข้าสู่ระบบ</button>
+        <p id="adminLoginError" style="color:#A85141;font-size:13px;margin-top:8px;display:none;"></p>
+      </div>
+      <div id="adminMain" style="display:none;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <h2 style="font-family:Chonburi,cursive;color:#3A2A1B;margin:0;">คิวรอตรวจ (แอดมิน)</h2>
+          <button id="adminLogoutBtn" style="background:#7C5A3E;color:#fff;border:none;border-radius:8px;padding:6px 12px;cursor:pointer;font-size:13px;">ออกจากระบบ</button>
+        </div>
+        <div id="adminList" style="display:flex;flex-direction:column;gap:12px;"></div>
+        <p id="adminEmpty" style="display:none;color:#7C5A3E;">ไม่มีรายการรอตรวจตอนนี้</p>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const auth = firebase.auth();
+    const loginBox = document.getElementById('adminLoginBox');
+    const mainBox = document.getElementById('adminMain');
+    const errorEl = document.getElementById('adminLoginError');
+
+    document.getElementById('adminLoginBtn').addEventListener('click', async () => {
+      const email = document.getElementById('adminEmail').value.trim();
+      const password = document.getElementById('adminPassword').value;
+      errorEl.style.display = 'none';
+      try {
+        await auth.signInWithEmailAndPassword(email, password);
+      } catch (e) {
+        errorEl.textContent = 'เข้าสู่ระบบไม่สำเร็จ: อีเมลหรือรหัสผ่านไม่ถูกต้อง';
+        errorEl.style.display = 'block';
+      }
+    });
+
+    document.getElementById('adminLogoutBtn').addEventListener('click', () => auth.signOut());
+
+    auth.onAuthStateChanged(user => {
+      if (user) {
+        loginBox.style.display = 'none';
+        mainBox.style.display = 'block';
+        loadPending();
+      } else {
+        loginBox.style.display = 'block';
+        mainBox.style.display = 'none';
+      }
+    });
+
+    async function loadPending() {
+      const listEl = document.getElementById('adminList');
+      const emptyEl = document.getElementById('adminEmpty');
+      listEl.innerHTML = 'กำลังโหลด...';
+      try {
+        const snap = await db.collection('pending').orderBy('createdAt', 'desc').get();
+        listEl.innerHTML = '';
+        if (snap.empty) {
+          emptyEl.style.display = 'block';
+          return;
+        }
+        emptyEl.style.display = 'none';
+        snap.forEach(doc => {
+          const d = doc.data();
+          const card = document.createElement('div');
+          card.style.cssText = 'background:#FBF6E9;border:2px solid #E9DCBB;border-radius:12px;padding:12px;';
+          card.innerHTML = `
+            <div style="font-size:11px;color:#7C5A3E;margin-bottom:4px;">บอท: ${escapeHtml(characters[d.characterId] ? characters[d.characterId].name : d.characterId)}</div>
+            <div style="margin-bottom:6px;"><b>ถาม:</b> ${escapeHtml(d.question)}</div>
+            <div style="margin-bottom:10px;"><b>ตอบ:</b> ${escapeHtml(d.answer)}</div>
+            <button data-action="approve" style="background:#74883F;color:#fff;border:none;border-radius:8px;padding:8px 14px;margin-right:8px;cursor:pointer;">✅ อนุมัติ</button>
+            <button data-action="reject" style="background:#A85141;color:#fff;border:none;border-radius:8px;padding:8px 14px;cursor:pointer;">❌ ไม่อนุมัติ</button>
+          `;
+          card.querySelector('[data-action="approve"]').addEventListener('click', () => approveItem(doc.id, d));
+          card.querySelector('[data-action="reject"]').addEventListener('click', () => rejectItem(doc.id));
+          listEl.appendChild(card);
+        });
+      } catch (e) {
+        listEl.innerHTML = 'โหลดไม่สำเร็จ: ' + e.message;
+      }
+    }
+
+    async function approveItem(docId, d) {
+      try {
+        const char = characters[d.characterId];
+        if (!char) throw new Error('unknown character: ' + d.characterId);
+        const ref = db.collection('brains').doc(char.storageKey);
+        const snap = await ref.get();
+        const learned = (snap.exists && snap.data().data) ? JSON.parse(snap.data().data) : {};
+        if (!learned[d.normQuestion]) learned[d.normQuestion] = [];
+        if (!learned[d.normQuestion].includes(d.answer)) learned[d.normQuestion].push(d.answer);
+        await ref.set({ data: JSON.stringify(learned), updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+        await db.collection('pending').doc(docId).delete();
+        loadPending();
+      } catch (e) {
+        alert('อนุมัติไม่สำเร็จ: ' + e.message);
+      }
+    }
+
+    async function rejectItem(docId) {
+      try {
+        await db.collection('pending').doc(docId).delete();
+        loadPending();
+      } catch (e) {
+        alert('ลบไม่สำเร็จ: ' + e.message);
+      }
+    }
+  }
 })();
 </script>
 </body>
